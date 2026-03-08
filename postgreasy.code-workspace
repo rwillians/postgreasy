@@ -1,0 +1,17 @@
+{
+  "folders": [
+    { "path": ".", "name": "monorepo" }
+  ],
+  "extensions": {
+    "recommendations": [
+      "EditorConfig.EditorConfig",
+      "ExpertLSP.expert"
+    ]
+  },
+  "settings": {
+    "tailwindCSS.includeLanguages": {
+      "phoenix-heex": "html"
+    }
+  }
+}
+
