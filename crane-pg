@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+#
+# crane-pg — PROTOTYPE agent in front of postgres (crane iteration 12).
+#
+# Runs as the container ENTRYPOINT. Asks crane-api what to do at boot
+# (fresh setup | restore | just start), keeps postgres supervised,
+# consumes control-plane commands over SSE, archives WAL to S3.
+#
+# Subcommands (invoked by postgres itself):
+#   crane-pg wal-push %p %f    archive_command
+#   crane-pg wal-fetch %f %p   restore_command
+#
+set -uo pipefail
+
+STAMP=/var/lib/postgresql/.crane-pg-bootstrapped
+ENVF=/var/lib/postgresql/.crane-pg.env
+FLAGSF=/var/lib/postgresql/.crane-pg.flags
+RESTORING_MARKER=/run/crane-pg.restoring
+
+log() { echo "crane-pg: $*" >&2; }
+
+# ----------------------------------------------------------------- S3
+
+s3_put() { # local_file s3_key
+  curl -fsS -o /dev/null --retry 2 --aws-sigv4 "aws:amz:us-east-1:s3" \
+    --user "$S3_ACCESS_KEY:$S3_SECRET_KEY" -T "$1" "$S3_ENDPOINT/$S3_BUCKET/$2"
+}
+
+s3_get() { # s3_key local_file
+  curl -fsS --aws-sigv4 "aws:amz:us-east-1:s3" \
+    --user "$S3_ACCESS_KEY:$S3_SECRET_KEY" -o "$2" "$S3_ENDPOINT/$S3_BUCKET/$1"
+}
+
+# ------------------------------------------------- WAL push and fetch
+
+wal_push() { # %p %f  (cwd is PGDATA, runs as user postgres)
+  local p="$1" f="$2"
+  source "$ENVF" || exit 1
+  zstd -q -f -o "/tmp/$f.zst" "$p" || exit 1
+  s3_put "/tmp/$f.zst" "$S3_PREFIX/wal/$f.zst"
+  local rc=$?
+  rm -f "/tmp/$f.zst"
+  exit $rc # nonzero → postgres keeps the segment and retries
+}
+
+wal_fetch() { # %f %p  (404 = end of archive, normal recovery ending)
+  local f="$1" p="$2"
+  source "$ENVF" || exit 1
+  s3_get "$WAL_PREFIX/$f.zst" "/tmp/$f.zst" || exit 1
+  zstd -q -d -f -o "$p" "/tmp/$f.zst"
+  local rc=$?
+  rm -f "/tmp/$f.zst"
+  exit $rc
+}
+
+# -------------------------------------------------- control plane API
+
+api_get() { curl -fsS "$CRANE_API/pg/instances/$CRANE_PG_ID$1"; }
+api_post() { # path json
+  curl -fsS -o /dev/null -X POST -H 'content-type: application/json' \
+    -d "$2" "$CRANE_API/pg/instances/$CRANE_PG_ID$1"
+}
+
+post_heartbeat() { # phase
+  local pending
+  pending=$(ls "$PGDATA/pg_wal/archive_status/" 2>/dev/null | grep -c '\.ready$')
+  api_post /heartbeat "{\"phase\":\"$1\",\"wal_pending\":$pending}" || true
+}
+
+post_result() { # command_id status result_json
+  api_post "/commands/$1/result" "{\"status\":\"$2\",\"result\":$3}" \
+    || log "result post failed for command $1 (will not retry — prototype)"
+}
+
+detect_phase() {
+  if [[ -f $RESTORING_MARKER ]]; then
+    echo restoring
+  elif gosu postgres pg_isready -q 2>/dev/null; then
+    case "$(gosu postgres psql -U postgres -tAc 'select pg_is_in_recovery()' 2>/dev/null)" in
+      f) echo ready ;;
+      t) echo recovering ;;
+      *) echo starting ;;
+    esac
+  else
+    echo starting
+  fi
+}
+
+heartbeat_loop() {
+  while :; do
+    post_heartbeat "$(detect_phase)"
+    sleep 5
+  done
+}
+
+# --------------------------------------------------------- bootstrap
+
+fetch_bootstrap() {
+  local out i
+  for i in $(seq 1 30); do
+    if out=$(api_get /bootstrap); then
+      echo "$out"
+      return 0
+    fi
+    if [[ -f $STAMP ]]; then
+      log "control plane unreachable but instance is bootstrapped — degraded local start"
+      echo '{"mode":"start-degraded"}'
+      return 0
+    fi
+    log "control plane unreachable, retrying ($i/30)"
+    sleep 2
+  done
+  log "bootstrap failed and no stamp — refusing to start (fail-closed first boot)"
+  exit 1
+}
+
+write_state() { # boot_json — persist S3 env + pg flags for wal subcommands and degraded starts
+  local wal_prefix
+  wal_prefix=$(jq -r '.wal_prefix // empty' <<<"$1")
+
+  jq -r '
+    "S3_ENDPOINT=\(.s3.endpoint)",
+    "S3_BUCKET=\(.s3.bucket)",
+    "S3_PREFIX=\(.s3.prefix)",
+    "S3_ACCESS_KEY=\(.s3.access_key)",
+    "S3_SECRET_KEY=\(.s3.secret_key)"
+  ' <<<"$1" >"$ENVF"
+  echo "WAL_PREFIX=${wal_prefix:-$(jq -r .s3.prefix <<<"$1")/wal}" >>"$ENVF"
+  chown postgres:postgres "$ENVF" && chmod 600 "$ENVF"
+
+  jq -r '.pg.args | to_entries[] | "-c", "\(.key)=\(.value)"' <<<"$1" >"$FLAGSF"
+}
+
+start_postgres() {
+  local flags=()
+  [[ -s $FLAGSF ]] && mapfile -t flags <"$FLAGSF"
+  log "starting postgres ${flags[*]:-}"
+  docker-entrypoint.sh postgres "${flags[@]}" &
+  PG_PID=$!
+}
+
+wait_ready() {
+  local i
+  for i in $(seq 1 300); do
+    [[ "$(detect_phase)" == ready ]] && return 0
+    kill -0 "$PG_PID" 2>/dev/null || return 1
+    sleep 2
+  done
+  return 1
+}
+
+# ----------------------------------------------------------- restore
+
+do_restore() { # boot_json
+  local boot="$1" workdir=/tmp/restore n=0 dirs=() prefix target
+  touch "$RESTORING_MARKER"
+  post_heartbeat restoring
+  rm -rf "$workdir" && mkdir -p "$workdir"
+
+  while read -r prefix; do
+    local d="$workdir/bk$n"
+    mkdir -p "$d/pg_wal"
+    log "fetching backup $n ($prefix)"
+    s3_get "$prefix/base.tar.zst" "$workdir/base.tar.zst" || return 1
+    zstd -q -d -c "$workdir/base.tar.zst" | tar -x -C "$d" || return 1
+    if s3_get "$prefix/pg_wal.tar.zst" "$workdir/pg_wal.tar.zst" 2>/dev/null; then
+      zstd -q -d -c "$workdir/pg_wal.tar.zst" | tar -x -C "$d/pg_wal" || return 1
+    fi
+    s3_get "$prefix/backup_manifest" "$d/backup_manifest" || return 1
+    rm -f "$workdir"/*.zst
+    dirs+=("$d")
+    n=$((n + 1))
+  done < <(jq -r '.chain[].s3_prefix' <<<"$boot")
+
+  log "assembling PGDATA from ${#dirs[@]} backup(s)"
+  if [[ ${#dirs[@]} -eq 1 ]]; then
+    mkdir -p "$PGDATA"
+    cp -a "${dirs[0]}/." "$PGDATA/"
+    rm -f "$PGDATA/backup_manifest"
+  else
+    pg_combinebackup "${dirs[@]}" -o "$PGDATA" || return 1
+  fi
+  mkdir -p "$PGDATA/pg_wal/archive_status"
+
+  target=$(jq -r '.target_time // empty' <<<"$boot")
+  {
+    echo "restore_command = 'crane-pg wal-fetch %f \"%p\"'"
+    [[ -n $target ]] && echo "recovery_target_time = '$target'"
+    [[ -n $target ]] && echo "recovery_target_action = 'promote'"
+  } >>"$PGDATA/postgresql.auto.conf"
+  touch "$PGDATA/recovery.signal"
+
+  chown -R postgres:postgres "$PGDATA" && chmod 700 "$PGDATA"
+  rm -rf "$workdir" "$RESTORING_MARKER"
+  log "recovery wiring written (target: ${target:-end of archive})"
+}
+
+# ----------------------------------------------------------- backups
+
+do_backup() { # command_json
+  local json="$1" cid bid type prefix parent out inc=()
+  cid=$(jq -r .id <<<"$json")
+  bid=$(jq -r .args.backup_id <<<"$json")
+  type=$(jq -r .args.type <<<"$json")
+  prefix=$(jq -r .args.s3_prefix <<<"$json")
+  parent=$(jq -r '.args.parent_manifest_path | select(type == "string")' <<<"$json")
+  out=/tmp/bk-$bid
+  log "backup $type $bid starting"
+
+  if [[ $type == incremental ]]; then
+    [[ -n $parent ]] \
+      || { post_result "$cid" failed '{"error":"no parent manifest path in command"}'; return; }
+    s3_get "$parent" /tmp/parent_manifest \
+      || { post_result "$cid" failed '{"error":"parent manifest fetch failed"}'; return; }
+    inc=(--incremental=/tmp/parent_manifest)
+  fi
+
+  rm -rf "$out"
+  if ! gosu postgres pg_basebackup -U postgres -D "$out" -Ft -Xstream "${inc[@]}" 2>/tmp/bk.err; then
+    post_result "$cid" failed "{\"error\":$(jq -Rs . </tmp/bk.err)}"
+    return
+  fi
+
+  local f rc=0
+  for f in base pg_wal; do
+    zstd -q -f "$out/$f.tar" -o "$out/$f.tar.zst" || rc=1
+    s3_put "$out/$f.tar.zst" "$prefix/$f.tar.zst" || rc=1
+  done
+  s3_put "$out/backup_manifest" "$prefix/backup_manifest" || rc=1
+  rm -rf "$out" /tmp/parent_manifest
+
+  if [[ $rc -eq 0 ]]; then
+    log "backup $bid uploaded"
+    post_result "$cid" succeeded "{\"manifest_path\":\"$prefix/backup_manifest\"}"
+  else
+    post_result "$cid" failed '{"error":"upload failed"}'
+  fi
+}
+
+# ------------------------------------------------------ command loop
+
+handle_command() { # command_json
+  local name
+  name=$(jq -r .name <<<"$1") || return
+  case "$name" in
+    backup) do_backup "$1" ;;
+    *) post_result "$(jq -r .id <<<"$1")" failed '{"error":"unknown command"}' ;;
+  esac
+}
+
+command_loop() {
+  while :; do
+    while read -r line; do
+      case "$line" in
+        data:*) handle_command "${line#data: }" ;;
+      esac
+    done < <(curl -fsN -H 'accept: text/event-stream' \
+      "$CRANE_API/pg/instances/$CRANE_PG_ID/commands" 2>/dev/null)
+    log "command stream dropped — reconnecting in 2s"
+    sleep 2
+  done
+}
+
+# -------------------------------------------------------------- main
+
+shutdown() {
+  log "TERM — stopping postgres"
+  kill -TERM "$PG_PID" 2>/dev/null
+  wait "$PG_PID" 2>/dev/null
+  local rf f
+  for rf in "$PGDATA"/pg_wal/archive_status/*.ready; do
+    [[ -e $rf ]] || break
+    f=$(basename "$rf" .ready)
+    log "final sweep: pushing $f"
+    gosu postgres crane-pg wal-push "$PGDATA/pg_wal/$f" "$f" && mv "$rf" "${rf%.ready}.done"
+  done
+  exit 0
+}
+
+main() {
+  : "${CRANE_PG_ID:?}" "${CRANE_API:?}" "${PGDATA:?}"
+  log "instance $CRANE_PG_ID — asking the control plane what to do"
+
+  local boot mode
+  boot=$(fetch_bootstrap) || exit 1
+  mode=$(jq -r .mode <<<"$boot")
+  log "mode: $mode"
+
+  case "$mode" in
+    start-degraded) ;; # reuse persisted env + flags, ask nothing
+    restore)
+      write_state "$boot"
+      export POSTGRES_PASSWORD=unused # entrypoint requires it; init is skipped
+      do_restore "$boot" || { log "restore failed"; post_heartbeat failed; exit 1; }
+      ;;
+    fresh | start)
+      write_state "$boot"
+      export POSTGRES_PASSWORD=$(jq -r '.pg.superuser_password // "postgres"' <<<"$boot")
+      ;;
+    *) log "unknown mode '$mode'"; exit 1 ;;
+  esac
+
+  trap shutdown TERM INT
+  start_postgres
+  heartbeat_loop &
+  command_loop &
+
+  if wait_ready; then
+    touch "$STAMP"
+    post_heartbeat ready
+    log "postgres is ready (stamp written)"
+  else
+    log "postgres never became ready"
+  fi
+
+  wait "$PG_PID"
+  local rc=$?
+  log "postgres exited ($rc)"
+  exit $rc
+}
+
+case "${1:-}" in
+  wal-push) shift; wal_push "$@" ;;
+  wal-fetch) shift; wal_fetch "$@" ;;
+  *) main ;;
+esac
