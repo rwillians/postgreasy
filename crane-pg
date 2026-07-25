@@ -129,6 +129,10 @@ write_state() { # boot_json — persist S3 env + pg flags for wal subcommands an
   chown postgres:postgres "$ENVF" && chmod 600 "$ENVF"
 
   jq -r '.pg.args | to_entries[] | "-c", "\(.key)=\(.value)"' <<<"$1" >"$FLAGSF"
+
+  # this process needs the state too (restore fetches, backup handler,
+  # final WAL sweep) — source what we just wrote
+  source "$ENVF"
 }
 
 start_postgres() {
