@@ -300,6 +300,10 @@ main() {
     *) log "unknown mode '$mode'"; exit 1 ;;
   esac
 
+  # the backup handler and final WAL sweep run in THIS process — they
+  # need the S3 env just like the wal subcommands do
+  source "$ENVF" || { log "no state env — cannot continue"; exit 1; }
+
   trap shutdown TERM INT
   start_postgres
   heartbeat_loop &
